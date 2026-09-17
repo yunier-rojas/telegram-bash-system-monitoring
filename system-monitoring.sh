@@ -112,6 +112,7 @@ CPU_ALERT_COOLDOWN=600     # seconds | affects --CPU alerts
 LA_ALERT_COOLDOWN=600      # seconds | shared across --LA1/--LA5/--LA15 alerts
 RAM_ALERT_COOLDOWN=600     # seconds | affects --RAM alerts
 DISK_ALERT_COOLDOWN=86400  # seconds | affects --DISK alerts (per mount); default: 24h
+DOCKER_ALERT_COOLDOWN=600  # seconds | affects --DOCKER-MONITOR alerts (per container/metric)
 #
 # Advanced env knobs (optional):
 #   SSHD_LOG_SOURCE="/var/log/auth.log"   or   SSHD_LOG_SOURCE="JOURNAL"
@@ -146,6 +147,7 @@ print_help() {
     echo "  --SSH                         Activates monitoring of SSH logins and sends alerts for logins from non-excluded IPs."
     echo "  --SFTP                        Activates monitoring of SFTP sessions and sends alerts for new sessions from non-excluded IPs."
     echo "  --REBOOT                      Sends an alert if the server has been rebooted since the last script execution."
+    echo "  --DOCKER-MONITOR              Activates monitoring of Docker container CPU and memory usage based on container labels."
     echo "  --DISK [DISK_%]               Disk usage alert threshold (default: 90%)."
     echo "  --DISK-TARGET <mount_point>   Specifies the mount point to monitor for disk usage. Must be used with --DISK."
     echo "  --DISK-LIST <file>            Loads disk targets+thresholds from a file (one entry per line, '#' comments allowed)."
@@ -694,6 +696,15 @@ _sm_reset_alert_cooldowns() {
     if ((${#_disk_files[@]})); then
         rm -f -- "${_disk_files[@]}" 2>/dev/null || true
     fi
+
+    # Docker cooldown files (per-container/metric)
+    local -a _docker_files=()
+    shopt -s nullglob
+    _docker_files=( "${SYSTEM_MONITORING_STATE_DIR}/docker.lastalert."* )
+    shopt -u nullglob
+    if ((${#_docker_files[@]})); then
+        rm -f -- "${_docker_files[@]}" 2>/dev/null || true
+    fi
 }
 
 _sm_handle_telegram_lock_transition() {
@@ -891,7 +902,7 @@ send_telegram_alert() {
 # Optional:                formatted_message="║ *${alert_type}* is high: *$message*\n║ Threshold: *$la_threshold*"
                 ;;
 
-            SSH-LOGIN|SFTP-MONITOR|REBOOT|EXTERNAL)
+            SSH-LOGIN|SFTP-MONITOR|REBOOT|EXTERNAL|DOCKER-CPU|DOCKER-MEMORY)
                 # Message already formatted by the caller
                 formatted_message="$message"
                 ;;
@@ -1995,6 +2006,13 @@ check_required_software() {
     if [[ "${SFTP_LOGIN_MONITORING:-0}" -eq 1 ]]; then
         required_commands["ss"]="$pkg_iproute"
         required_commands["ps"]="$pkg_procps"
+    fi
+
+    # Docker container monitoring deps (only if enabled)
+    if [[ "${DOCKER_MONITORING:-0}" -eq 1 ]]; then
+        required_commands["docker"]="docker"
+        required_commands["jq"]="jq"
+        required_commands["bc"]="bc"
     fi
 
     # Ping monitoring deps (only if needed)
@@ -4805,6 +4823,150 @@ check_reboot() {
 
 
 
+# -------------------------------------------------------------------
+# Docker container monitoring (CPU + memory) via container labels
+# -------------------------------------------------------------------
+# Per-container thresholds are read from Docker labels:
+#   alert.cpu_threshold    -> CPU percent (e.g. "90")
+#   alert.memory_threshold -> memory size (e.g. "1000MiB", "1GiB")
+# Missing labels fall back to DOCKER_CPU_THRESHOLD_DEFAULT /
+# DOCKER_MEMORY_THRESHOLD_DEFAULT.
+# -------------------------------------------------------------------
+
+# Convert a memory size string (e.g. 1.5GiB, 1Gi, 500MB, 1024) to MiB.
+# Case-insensitive; accepts B/K/Ki/KiB/M/Mi/MiB/G/Gi/GiB/T/Ti/TiB (all with or
+# without a trailing 'B'). Prints the value in MiB or nothing on parse failure.
+_docker_mem_to_mib() {
+    local v="$1" num unit
+    num="${v//[^0-9.]/}"
+    unit="${v//[0-9.]/}"
+    unit="${unit//[[:space:]]/}"
+    unit="${unit,,}"
+
+    [[ -n "$num" ]] || return 0
+
+    case "$unit" in
+        ""|m|mi|mib|mb) printf '%s' "$num" ;;
+        g|gi|gib|gb)    awk -v n="$num" 'BEGIN { printf "%.0f", n * 1024 }' ;;
+        t|ti|tib|tb)    awk -v n="$num" 'BEGIN { printf "%.0f", n * 1024 * 1024 }' ;;
+        k|ki|kib|kb)    awk -v n="$num" 'BEGIN { printf "%.2f", n / 1024 }' ;;
+        b)              awk -v n="$num" 'BEGIN { printf "%.4f", n / 1024 / 1024 }' ;;
+        *)              printf '%s' "$num" ;;
+    esac
+}
+
+# Emit an alert for a container metric, applying a per-container/metric cooldown.
+# Args: container_name metric(cpu|mem) message
+_docker_send_alert() {
+    local container_name="$1"
+    local metric="$2"
+    local message="$3"
+    local alert_type="DOCKER-CPU"
+    [[ "$metric" == "mem" ]] && alert_type="DOCKER-MEMORY"
+
+    local cooldown_seconds="${DOCKER_ALERT_COOLDOWN:-600}"
+    [[ "$cooldown_seconds" =~ ^-?[0-9]+$ ]] || cooldown_seconds=600
+    (( cooldown_seconds < 0 )) && cooldown_seconds=0
+
+    local safe_name="${container_name//[^A-Za-z0-9_.-]/_}"
+    [[ -n "$safe_name" ]] || safe_name="unknown"
+    local state_file="${SYSTEM_MONITORING_STATE_DIR}/docker.lastalert.${safe_name}.${metric}"
+
+    local now last=0
+    now="$(date +%s)"
+    if [[ -r "$state_file" ]]; then
+        read -r last < "$state_file" 2>/dev/null || true
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    fi
+    if (( cooldown_seconds > 0 && now - last < cooldown_seconds )); then
+        return 0
+    fi
+
+    echo "$message"
+    send_telegram_alert "$alert_type" "$message"
+    local __rc=$?
+
+    # Start cooldown on success (0) OR intentional suppression via lock (2).
+    if [[ $__rc -eq 0 || $__rc -eq 2 ]]; then
+        printf '%s\n' "$now" > "$state_file" 2>/dev/null || true
+    fi
+}
+
+check_docker_containers() {
+    echo "Starting Docker container checks..."
+
+    # Fetch stats for ALL running containers in a single call (avoids one
+    # `docker stats` invocation per container). Keyed by container name.
+    local -A __docker_stats_by_name=()
+    local st_name st_cpu st_mem
+    while IFS='|' read -r st_name st_cpu st_mem; do
+        [[ -n "$st_name" ]] || continue
+        __docker_stats_by_name["${st_name#/}"]="${st_cpu}|${st_mem}"
+    done < <(docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null)
+
+    local container_id container_name
+    while read -r container_id container_name; do
+        [[ -n "$container_name" ]] || continue
+        echo "Checking container: $container_name (ID: $container_id)"
+
+        # Get all labels of the container
+        local labels
+        labels=$(docker inspect --format '{{ json .Config.Labels }}' "$container_name" 2>/dev/null)
+
+        # Extract alert thresholds from labels (empty when unset/null)
+        local cpu_threshold memory_threshold
+        cpu_threshold=$(printf '%s' "$labels" | jq -r '."alert.cpu_threshold" // empty' 2>/dev/null)
+        memory_threshold=$(printf '%s' "$labels" | jq -r '."alert.memory_threshold" // empty' 2>/dev/null)
+
+        # Strip decoration (e.g. "80%") and whitespace before validation
+        cpu_threshold="${cpu_threshold//%/}"
+        cpu_threshold="${cpu_threshold//[[:space:]]/}"
+        memory_threshold="${memory_threshold//[[:space:]]/}"
+
+        # Use default values if labels are not set
+        cpu_threshold="${cpu_threshold:-$DOCKER_CPU_THRESHOLD_DEFAULT}"
+        memory_threshold="${memory_threshold:-$DOCKER_MEMORY_THRESHOLD_DEFAULT}"
+
+        # Sanitize thresholds so bc never receives garbage from a bad label
+        [[ "$cpu_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || cpu_threshold="$DOCKER_CPU_THRESHOLD_DEFAULT"
+        [[ -n "$(_docker_mem_to_mib "$memory_threshold")" ]] || memory_threshold="$DOCKER_MEMORY_THRESHOLD_DEFAULT"
+
+        # Look up stats gathered above; skip metrics for containers with no stats
+        local stats cpu_usage mem_used
+        stats="${__docker_stats_by_name[$container_name]:-}"
+        cpu_usage="${stats%%|*}"
+        cpu_usage="${cpu_usage//%/}"
+        mem_used="${stats#*|}"
+        mem_used="${mem_used%% *}"
+
+        # Check CPU usage against the threshold
+        if [[ -n "$cpu_usage" && -n "$cpu_threshold" ]] && \
+           [[ "$cpu_usage" =~ ^[0-9]+(\.[0-9]+)?$ ]] && \
+           (( $(echo "$cpu_usage > $cpu_threshold" | bc -l) )); then
+            _docker_send_alert "$container_name" "cpu" \
+                "$container_name: High CPU usage detected: $cpu_usage%"
+        fi
+
+        # Check Memory usage against the threshold
+        local memory_value_in_mib memory_threshold_in_mib
+        memory_value_in_mib="$(_docker_mem_to_mib "$mem_used")"
+        memory_threshold_in_mib="$(_docker_mem_to_mib "$memory_threshold")"
+
+        if [[ -n "$memory_value_in_mib" && -n "$memory_threshold_in_mib" ]] && \
+           (( $(echo "$memory_value_in_mib > $memory_threshold_in_mib" | bc -l) )); then
+            _docker_send_alert "$container_name" "mem" \
+                "$container_name: High memory usage detected: ${memory_value_in_mib} MiB"
+        fi
+    done < <(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null)
+
+    unset __docker_stats_by_name
+
+    echo "Docker container checks completed."
+}
+
+
+
+
 
 
 # -------------------------------------------------------------------
@@ -4837,6 +4999,13 @@ EXTERNAL_SPEC_ERROR=""
 SSH_LOGIN_MONITORING=0
 SFTP_LOGIN_MONITORING=0
 REBOOT_MONITORING=0
+DOCKER_MONITORING=0
+
+# Docker container alert defaults (overridable per container via labels).
+#   alert.cpu_threshold    -> percent (e.g. 90)
+#   alert.memory_threshold -> memory size (e.g. 1000MiB, 1GiB)
+DOCKER_CPU_THRESHOLD_DEFAULT=90
+DOCKER_MEMORY_THRESHOLD_DEFAULT="1000MiB"
 
 # Trim leading/trailing whitespace (bash-only; no external deps)
 trim_ws() {
@@ -5985,6 +6154,7 @@ fast_monitor_resources() {
 
         [[ "${SFTP_LOGIN_MONITORING:-0}" -eq 1 ]] && check_sftp_activity
         [[ "${SSH_LOGIN_MONITORING:-0}" -eq 1 ]] && check_ssh_activity
+        [[ "${DOCKER_MONITORING:-0}" -eq 1 ]] && check_docker_containers
 
         # Update the user-facing combined snapshot file
         [[ "${SSH_LOGIN_MONITORING:-0}" -eq 1 || "${SFTP_LOGIN_MONITORING:-0}" -eq 1 ]] && write_activity_snapshot_file
@@ -6148,6 +6318,10 @@ parse_arguments() {
                 REBOOT_MONITORING=1
                 shift
                 ;;
+            --DOCKER|--DOCKER-MONITOR)
+                DOCKER_MONITORING=1
+                shift
+                ;;
             --PING)
                 if [[ -z "$2" || "$2" == --* ]]; then
                     echo "Error: --PING must be followed by a target spec."
@@ -6237,6 +6411,10 @@ validate_thresholds() {
     
     if [[ "${SFTP_LOGIN_MONITORING:-0}" -eq 1 ]]; then
         echo "SFTP Login Monitoring: Enabled"
+        enabled=1
+    fi
+    if [[ "${DOCKER_MONITORING:-0}" -eq 1 ]]; then
+        echo "Docker Monitoring: Enabled (CPU default: ${DOCKER_CPU_THRESHOLD_DEFAULT}%, Memory default: ${DOCKER_MEMORY_THRESHOLD_DEFAULT})"
         enabled=1
     fi
         # SSH/SFTP excluded IP list (file-based + hardcoded)
